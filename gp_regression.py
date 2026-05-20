@@ -137,9 +137,14 @@ def predict(dist_test, dists_train, y_train, params, delta=1e-6, D_train=None):
         for i in range(n)
     ])
 
-    c, low = cho_factor(K_train)
-    alpha  = cho_solve((c, low), y_train)
+    try:
+        c, low = cho_factor(K_train)
+    except np.linalg.LinAlgError:
+        # Rare but possible when delta is too small relative to condition number;
+        # fall back to a safe zero prediction rather than crashing.
+        return 0.0, float(kernel_power_exp_single(0.0, sigma2, ell, H))
 
+    alpha  = cho_solve((c, low), y_train)
     y_pred = float(r @ alpha)
 
     v      = cho_solve((c, low), r)
