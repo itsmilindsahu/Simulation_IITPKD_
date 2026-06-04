@@ -41,8 +41,15 @@ python plot_results.py     # generate diagnostic plots
 Results will vary slightly between runs due to random seed and optimizer non-determinism.
 See paper Table I for reference values (n=100 train, n=500 test).
 
-**Generated plots:** `fig1_densities.png`, `scatter_dist.png`, `rmse_comparison.png`,
-`error_histogram.png`, `residuals_plot.png`, `qq_plot.png`
+**Generated plots:**
+
+![fig1_densities](fig1_densities.png)
+![scatter_dist](scatter_dist.png)
+![rmse_comparison](rmse_comparison.png)
+![error_histogram](error_histogram.png)
+![residuals_plot](residuals_plot.png)
+![qq_plot](qq_plot.png)
+![cir_comparison](cir_comparison.png)
 
 ---
 
