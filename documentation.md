@@ -1,396 +1,314 @@
-# Simulation Study Documentation
-## Replicating Bachoc et al. (2018) — *A Gaussian Process Regression Model for Distribution Inputs*
-### IITPKD Summer Internship 2026 | Supervisor: Dr. Tanmay Sahoo
+# 🎯 How We Taught a Computer to Predict Things About Distributions
+### A slide-by-slide walkthrough — no scary math required
 
 ---
 
-## What We Are Replicating
+## Slide 1 — What Problem Are We Solving?
 
-The paper proposes using Gaussian Processes (GP) to predict a scalar output when the **inputs are probability distributions** (not vectors). The core idea: replace the usual Euclidean distance between points with the **Wasserstein-2 (W₂) distance** between distributions when building the GP covariance kernel.
+Imagine you have a bag of marbles. Some bags have marbles bunched in the middle. Some are spread out. Some are lopsided.
 
-The simulation (Section VI of the paper) compares three models on 100 training distributions and 500 test distributions:
-- **"distribution"** — GP with W₂-based kernel (their method)
-- **"Legendre"** — GP on Legendre polynomial projections of the density
-- **"PCA"** — GP on principal components of the discretised density
+**Your job:** Look at a bag → Predict a number we care about.
 
-The paper's result (Table I): the distribution model achieves RMSE = 0.094, while Legendre and PCA stay well above 0.29 at best.
+That number is:
 
-Our replication result: **RMSE ≈ 0.169**, confirming the paper's qualitative claim that the W₂-based GP strongly outperforms projection-based methods.
+> **"The average marble position ÷ (a tiny bit + how spread-out the bag is)"**
 
----
+If the marbles are all in the middle → small spread → big number.  
+If the marbles are all over the place → big spread → small number.
 
-## Repository Structure
-
-```
-Simulation_IITPKD_/
-├── data_generation.py   — Generate synthetic distributions (Section VI-A of paper)
-├── wasserstein.py       — W₂ distance via quantile functions (Section III-a)
-├── kernels.py           — Power-exponential kernel family (eq. 14 of paper)
-├── gp_regression.py     — MLE parameter fitting + Kriging prediction (Section V-A)
-├── baselines.py         — Legendre and PCA baseline models
-├── run_simulation.py    — Main pipeline: generates Table I results
-└── plot_results.py      — 6 publication-quality diagnostic plots
-```
+We want a computer to **learn this rule from examples**, without being told the formula.
 
 ---
 
-## Step 1: Generating Distributions — `data_generation.py`
+## Slide 2 — What is a "Distribution Input"?
 
-**What the paper says (Section VI-A):**
-Each distribution νᵢ is built by:
-1. Sampling μᵢ ~ Uniform(0.3, 0.7) and σᵢ ~ Uniform(0.001, 0.2)
-2. Taking the Gaussian density fᵢ = N(μᵢ, σᵢ²) on [0, 1]
-3. Perturbing it with a GP sample: gᵢ(x) = fᵢ(x) · exp(Zᵢ(x)), where Zᵢ ~ GP(0, Matérn-5/2)
-4. Normalising: νᵢ has density gᵢ / (∫gᵢ dx)
+Normal machine learning:
+> Input = a list of numbers like `[1.2, 3.4, 0.7]`
 
-This gives distributions that are not restricted to a parametric family — they have random asymmetries and shapes, making linear projections suboptimal.
+Our problem:
+> Input = **a whole bag of marbles** (a probability distribution)
 
-**The Matérn-5/2 kernel used for perturbation:**
+We can't just feed a bag into a standard model. We need a smarter way to compare bags.
 
-```python
-def matern52_cov(x1, x2, length_scale=0.2):
-    r = np.abs(x1[:, None] - x2[None, :])      # pairwise distances
-    s = np.sqrt(5) * r / length_scale
-    C = (1 + s + s**2 / 3) * np.exp(-s)        # Matern-5/2 formula
-    return C
-```
-
-Why Matérn-5/2? It produces smooth but not infinitely differentiable paths — matches the paper's choice of σ=1, ℓ=0.2.
-
-**Sampling a GP and building the perturbed density:**
-
-```python
-C = matern52_cov(x_grid, x_grid, length_scale=0.2)
-C += 1e-8 * np.eye(n_grid)          # small nugget for numerical stability
-L = np.linalg.cholesky(C)           # Cholesky decomposition: C = L Lᵀ
-z_i = L @ rng.standard_normal(n_grid)   # one GP sample: z ~ N(0, C)
-
-g_i = f_i * np.exp(z_i)            # perturbed (always positive)
-norm_const = trapezoid(g_i, x_grid) # integrate to normalise
-density = g_i / norm_const
-```
-
-Key insight: multiplying by `exp(z_i)` keeps the density positive everywhere. The `trapezoid` rule (scipy) approximates the normalisation integral numerically.
-
-**The target function F(ν):**
-
-```python
-def target_function(samples):
-    m1 = np.mean(samples)           # first moment = mean
-    m2 = np.mean(samples ** 2)      # second moment
-    variance = max(0.0, m2 - m1**2) # clamp to avoid sqrt of negative
-    F_val = m1 / (0.05 + np.sqrt(variance))
-    return F_val
-```
-
-This is equation F(ν) = m₁(ν) / (0.05 + √(m₂(ν) − m₁(ν)²)) directly from the paper. It mixes the mean and standard deviation in a nonlinear way — a function that W₂ measures similarity for naturally, but L² projections of densities do not.
+**Key question:** When are two bags "similar"?
 
 ---
 
-## Step 2: Wasserstein-2 Distance — `wasserstein.py`
+## Slide 3 — Two Ways to Compare Bags
 
-**The key mathematical fact (paper eq. 2 and 24):**
+**Bad way — compare the shapes of the histograms directly (L² distance)**
 
-For 1D distributions, W₂ has a clean closed form:
+Imagine two bags:
+- Bag A: marbles bunched around position 0.3
+- Bag B: marbles bunched around 0.35
 
-W₂²(μ, ν) = ∫₀¹ (F⁻¹_μ(t) − F⁻¹_ν(t))² dt
+Their histogram *shapes* look almost the same, but shifted a tiny bit. L² distance says they're *very different* because the bar heights at each position differ a lot.
 
-i.e. the L² distance between the **quantile functions** (inverse CDFs), not the densities. This is the optimal coupling result: evaluating both quantile functions at the same uniform u gives the cheapest transport plan.
+**Good way — Wasserstein-2 (W₂) distance**
 
-**Estimating the quantile function from samples:**
+> "How much work does it take to *move* Bag A's marbles to match Bag B?"
 
-```python
-def quantile_function(samples, t_grid):
-    sorted_s = np.sort(samples)         # sorted samples = empirical quantile function
-    n = len(sorted_s)
-    levels = np.linspace(0, 1, n)       # quantile levels k/(n-1)
-    q_vals = np.interp(t_grid, levels, sorted_s)   # interpolate at requested t
-    return q_vals
-```
+A tiny shift costs almost nothing. That's a small W₂ distance. ✅
 
-Sorting the samples directly gives the empirical quantile function — no density estimation needed.
+Two bags with very different spreads cost a lot to rearrange. That's a big W₂ distance. ✅
 
-**Computing W₂:**
+W₂ matches our *intuition* about similarity far better than comparing histogram bars.
+
+---
+
+## Slide 4 — How We Actually Compute W₂
+
+**The magic trick:** Sort the marbles.
+
+The sorted list of marbles **is** the quantile function (fancy name: inverse CDF).
+
+W₂ between two bags = the average squared difference between their **sorted marble lists**.
 
 ```python
 def wasserstein2(samples_mu, samples_nu, n_grid=200):
-    t_grid = np.linspace(0.01, 0.99, n_grid)   # avoid endpoints
+    t_grid = np.linspace(0.01, 0.99, n_grid)
+
+    # Sort each bag → that's the quantile function
     q_mu = quantile_function(samples_mu, t_grid)
     q_nu = quantile_function(samples_nu, t_grid)
-    w2_squared = np.mean((q_mu - q_nu) ** 2)   # discrete integral
+
+    # Average squared gap between sorted lists
+    w2_squared = np.mean((q_mu - q_nu) ** 2)
     return np.sqrt(w2_squared)
 ```
 
-Both quantile functions are evaluated on the **same** t_grid — this is exactly the optimal coupling from the paper. The mean replaces the continuous integral.
+> **In plain English:** Line up both bags from smallest to largest. At each rank (1st, 2nd, 3rd marble...), measure the gap. Average all those gaps. That's W₂.
 
-**Building the full pairwise distance matrix:**
+No density estimation. No grids. Just sort and compare. 🎉
+
+---
+
+## Slide 5 — Building the Distance Table
+
+We have 100 training bags. We compare **every pair**.
 
 ```python
 def pairwise_w2_matrix(distributions, n_grid=200):
     n = len(distributions)
     D = np.zeros((n, n))
     for i in range(n):
-        for j in range(i + 1, n):           # upper triangle only
-            d = wasserstein2(distributions[i], distributions[j], n_grid)
+        for j in range(i + 1, n):
+            d = wasserstein2(distributions[i], distributions[j])
             D[i, j] = d
-            D[j, i] = d                     # W₂ is symmetric
+            D[j, i] = d   # distance is symmetric
     return D
 ```
 
-This is an O(N²) operation — for N=100 training distributions it computes 4,950 pairwise distances. This matrix is then used by the kernel to build the GP covariance matrix.
+Result: a 100×100 table where `D[i][j]` = "how different are Bag i and Bag j?"
+
+> Think of it like a travel-time table between 100 cities. Once you have it, you never need to recompute.
 
 ---
 
-## Step 3: The Kernel — `kernels.py`
+## Slide 6 — Gaussian Processes in 30 Seconds
 
-**Paper eq. (14) — Power-exponential kernel:**
+A **Gaussian Process (GP)** is a model that says:
 
-K_{σ², ℓ, H}(μ, ν) = σ² · exp( −W₂(μ, ν)^{2H} / ℓ )
+> "Nearby inputs should have nearby outputs. The more similar two inputs are, the more similar I expect their outputs to be."
 
-Three parameters: σ² (variance), ℓ (length scale), H ∈ (0,1] (smoothness exponent).
+It's like saying: *"If Bag A and Bag B look almost the same, their predicted numbers should be almost the same too."*
 
-- H = 1/2 → Laplace / exponential kernel
-- H = 1 → Gaussian / squared-exponential kernel
+The GP doesn't use a fixed formula. It's a **flexible interpolator** that also tells you **how uncertain it is** about each prediction.
 
-The paper proves (Theorem IV.2) this is a valid positive-definite kernel on the Wasserstein space for any completely monotone function F, which `exp(−·)` satisfies.
+Two things the GP needs:
+1. A way to measure "how similar are two inputs?" → **the kernel**
+2. Training examples → **our 100 (bag, number) pairs**
 
-**Implementation:**
+---
+
+## Slide 7 — The Kernel: Turning Distance Into Similarity
+
+We have W₂ distances. The kernel converts a distance into a similarity score (between 0 and 1):
+
+```
+K(Bag_i, Bag_j) = σ² × exp( − W₂(i, j)^(2H) / ℓ )
+```
+
+Three knobs:
+- **σ²** — how much the outputs vary overall (output scale)
+- **ℓ** — how far apart two bags can be and still be "similar" (length scale)
+- **H** — how smooth the relationship is (H ≈ 1 → very smooth, H = 0.5 → rougher)
 
 ```python
 def kernel_power_exp(D, sigma2, ell, H):
-    # D is the (n,n) pairwise W2 distance matrix
     K = sigma2 * np.exp(-(D ** (2*H)) / ell)
     return K
-
-def add_nugget(K, delta=1e-6):
-    # Small diagonal addition for numerical positive-definiteness
-    return K + delta * np.eye(len(K))
 ```
 
-The nugget (δ on the diagonal) ensures the covariance matrix is strictly positive-definite, preventing Cholesky failures during inversion.
+> **In plain English:** Bags with small W₂ distance → kernel score near 1 (very similar).  
+> Bags far apart → kernel score near 0 (not similar). This tells the GP who to "listen to."
 
 ---
 
-## Step 4: GP Regression — `gp_regression.py`
+## Slide 8 — Learning the Knobs (MLE)
 
-### 4a. Maximum Likelihood Estimation
+We don't guess σ², ℓ, H. We **learn** them from data.
 
-**Paper eq. (19) — the negative log-likelihood to minimise:**
-
-L_θ = (1/n) · [log det R_θ + yᵀ R_θ⁻¹ y]
-
-where R_θ = [K_θ(μᵢ, μⱼ)]_{i,j} is the n×n training covariance matrix.
-
-**Key trick — unconstrained parametrisation:**
-
-```python
-sigma2 = np.exp(params[0])              # always positive
-ell    = np.exp(params[1])              # always positive
-H      = 1 / (1 + np.exp(-params[2]))  # sigmoid maps R → (0,1)
-```
-
-We optimise over (log σ², log ℓ, logit H) — all unconstrained reals — then transform back. This lets `scipy.minimize` (L-BFGS-B) work without explicit bounds.
-
-**Computing the NLL efficiently using Cholesky:**
+We find the knob settings that make the training data most "likely" under the GP. This is called **Maximum Likelihood Estimation (MLE)**.
 
 ```python
 def neg_log_likelihood(params, D_train, y_train, delta=1e-6):
-    # ... build K ...
-    c, low = cho_factor(K)                         # K = L Lᵀ
-    log_det = 2 * np.sum(np.log(np.diag(c)))       # log det K = 2 Σ log L_ii
-    alpha = cho_solve((c, low), y_train)            # K⁻¹ y via triangular solves
-    quad = y_train @ alpha                          # yᵀ K⁻¹ y
-    nll = (log_det + quad) / n
-    return nll
+    sigma2 = np.exp(params[0])               # keep positive
+    ell    = np.exp(params[1])               # keep positive
+    H      = 1 / (1 + np.exp(-params[2]))   # keep between 0 and 1
+
+    K = kernel_power_exp(D_train, sigma2, ell, H)
+    K += delta * np.eye(len(K))              # small safety padding
+
+    # Cholesky: efficient and stable way to invert K
+    c, low = cho_factor(K)
+    log_det = 2 * np.sum(np.log(np.diag(c)))
+    alpha   = cho_solve((c, low), y_train)
+    quad    = y_train @ alpha
+
+    return (log_det + quad) / len(y_train)   # smaller = better fit
 ```
 
-Cholesky is preferred over direct inversion: it costs O(N³) once, then O(N²) per solve, and is numerically stable.
+We run an optimiser (`L-BFGS-B`) 5 times from random starting knob values, take the best result.
 
-**Multi-start optimisation:**
+Our best knobs: **σ² ≈ 56.5, ℓ ≈ 0.157, H ≈ 0.98**
 
-```python
-def fit_gp(D_train, y_train, n_restarts=5):
-    best_nll = np.inf
-    for _ in range(n_restarts):
-        x0 = rng.uniform([-2, -2, -2], [2, 2, 2])   # random start
-        res = minimize(neg_log_likelihood, x0, ...)
-        if res.fun < best_nll:
-            best_nll = res.fun
-            best_raw = res.x
-    return decode(best_raw)   # sigma2, ell, H
-```
+---
 
-Multiple restarts guard against local minima in the non-convex likelihood surface.
+## Slide 9 — Making a Prediction (Kriging)
 
-### 4b. Kriging Prediction
+New bag comes in. We've never seen it. What's its number?
 
-**Paper eq. (20) — posterior mean:**
-
-Ŷ_θ(μ*) = r_θ(μ*)ᵀ R_θ⁻¹ y
-
-where r_θ(μ*)ᵢ = K_θ(μ*, μᵢ) is the cross-covariance vector between the test point and all training points.
-
-**Posterior variance (uncertainty quantification):**
-
-Var_θ(μ*) = K_θ(μ*, μ*) − r_θ(μ*)ᵀ R_θ⁻¹ r_θ(μ*)
+**Step 1:** Compute W₂ from the new bag to all 100 training bags.  
+**Step 2:** Turn those distances into similarity scores using the kernel → vector `r`.  
+**Step 3:** The prediction is a weighted average of training outputs, where weights come from `r`.
 
 ```python
-def predict(dist_test, dists_train, y_train, params, D_train):
-    # Cross-covariance: distance from test to each training distribution
+def predict(dist_test, dists_train, y_train, params, K_train):
+    # Similarity of new bag to each training bag
     r = np.array([
-        kernel_power_exp_single(wasserstein2(dist_test, dists_train[i]), ...)
-        for i in range(n)
+        kernel_single(wasserstein2(dist_test, dists_train[i]), params)
+        for i in range(len(dists_train))
     ])
-    c, low = cho_factor(K_train)
-    alpha = cho_solve((c, low), y_train)   # K⁻¹ y
-    y_pred = float(r @ alpha)              # posterior mean
 
-    v = cho_solve((c, low), r)             # K⁻¹ r
-    y_var = float(max(0.0, sigma2 - r @ v))  # posterior variance, clamped ≥ 0
+    c, low = cho_factor(K_train)
+    alpha  = cho_solve((c, low), y_train)   # learned weights
+
+    y_pred = float(r @ alpha)               # weighted sum → prediction
+
+    v      = cho_solve((c, low), r)
+    y_var  = float(max(0.0, params['sigma2'] - r @ v))  # uncertainty estimate
     return y_pred, y_var
 ```
 
-The clamping to 0 handles tiny negative values from floating-point rounding.
+> **In plain English:** "The new bag looks most like Bag 17 and Bag 42. So my prediction leans heavily on their outputs. And here's how confident I am."
 
 ---
 
-## Step 5: Baseline Models — `baselines.py`
+## Slide 10 — The Baselines (What We're Beating)
 
-### Legendre Projection
-For each distribution νᵢ with density f_νᵢ on [0, 1], compute projections onto normalised Legendre polynomials p₀, p₁, ..., p_{o−1}:
+**Legendre projection:** Describe each bag by 5 or 15 numbers (how much it "looks like" each polynomial shape). Feed those numbers to a standard GP.
 
-aᵢₖ = ∫₀¹ f_νᵢ(t) · pₖ(t) dt
+**PCA projection:** Squish each bag's histogram down to its top 5 principal components. Feed those to a standard GP.
 
-The GP then operates on the o-dimensional feature vector (aᵢ₀, ..., aᵢ,_{o-1}) with a standard power-exponential kernel. Tested at orders 5, 10, 15.
-
-### PCA Projection
-Discretise each density onto a grid of d=100 points, then take the first o principal components. The GP operates on the PCA projection vector. Same kernel family as Legendre.
-
-**Why these fail:** Both projections measure L² similarity between density functions. Two distributions with similar means but very different variances will have very different L² projections, even though they may be close in W₂ distance (and therefore have similar target values F(ν)).
+**The problem with both:** They measure L² similarity between *density shapes*, not W₂ similarity. Two bags with the same mean but different spreads look very *different* under L² — but have similar F(ν) values. The projection GPs get confused. Our W₂ GP does not.
 
 ---
 
-## Step 6: Metrics — `run_simulation.py`
+## Slide 11 — How We Made the Fake Bags (Data Generation)
 
-**RMSE (Root Mean Squared Error):**
+Each bag is a random bumpy distribution on [0, 1]:
 
-RMSE² = (1/nₜ) Σᵢ [F(νₜ,ᵢ) − F̂(νₜ,ᵢ)]²
-
-Should be as small as possible.
-
-**CIR₀.₉ (Confidence Interval Ratio at 90%):**
-
-CIR₀.₉ = (1/nₜ) Σᵢ 1{ |F(νₜ,ᵢ) − F̂(νₜ,ᵢ)| ≤ q₀.₉₅ · σ̂(νₜ,ᵢ) }
-
-Should be close to 0.9. This checks whether the GP's predicted uncertainty σ̂ is well-calibrated — i.e., do 90% of true values actually fall within the 90% confidence interval?
+1. Pick a random centre μ ~ Uniform(0.3, 0.7) and width σ ~ Uniform(0.001, 0.2)
+2. Start with a Gaussian bump: `f = Normal(μ, σ²)`
+3. Add random "waviness" using a GP sample `z`: `g = f × exp(z)`
+4. Normalise so it sums to 1 → that's your bag's density
 
 ```python
-def compute_metrics(y_true, y_pred, y_std, alpha=0.9):
-    errors = y_true - y_pred
-    rmse = np.sqrt(np.mean(errors**2))
+# Step 3: the waviness
+C  = matern52_cov(x_grid, x_grid, length_scale=0.2)
+C += 1e-8 * np.eye(n_grid)           # numerical safety
+L  = np.linalg.cholesky(C)
+z_i = L @ rng.standard_normal(n_grid)  # one random wiggly curve
 
-    q = norm.ppf(0.5 + alpha/2)       # 1.645 for alpha=0.9
-    in_interval = np.abs(errors) <= q * y_std
-    cir = np.mean(in_interval)
-    return rmse, cir
+g_i = f_i * np.exp(z_i)             # always positive!
+density = g_i / trapezoid(g_i, x_grid)  # normalise to area = 1
 ```
+
+Why `exp(z)`? Multiplying by exp of anything keeps values positive — a density can never go negative.
+
+The result: bags that are Gaussian-ish but with random asymmetries and bumps. No two are alike.
 
 ---
 
-## Results
+## Slide 12 — The Target Number F(ν)
 
-Our replication of Table I:
+Once we have a bag's samples, we compute:
 
-| Model               | RMSE  | CIR₀.₉ |
-|---------------------|-------|---------|
-| **distribution (W₂)** | **0.169** | **0.87** |
-| Legendre order 5    | 0.956 | 0.84 |
-| PCA order 5         | 0.986 | 0.77 |
+```python
+def target_function(samples):
+    m1 = np.mean(samples)            # average marble position
+    m2 = np.mean(samples ** 2)       # average of squared positions
+    variance = max(0.0, m2 - m1**2)  # spread² (clamped ≥ 0)
+    return m1 / (0.05 + np.sqrt(variance))
+```
 
-Paper's Table I values:
+> Mean divided by (a tiny constant + standard deviation)
 
-| Model               | RMSE  | CIR₀.₉ |
-|---------------------|-------|---------|
-| **distribution (W₂)** | **0.094** | 0.92 |
-| Legendre order 5    | 0.49  | 0.92 |
-| Legendre order 15   | 0.29  | 0.91 |
-| PCA order 5         | 0.63  | 0.82 |
+If marbles are centred high AND tightly packed → big number.  
+If marbles are spread all over → small number.
 
-**Why our RMSE is higher than the paper's 0.094:** The paper used 500 samples per distribution for the target function estimate and ran more optimisation restarts. With 200 samples and fewer restarts, variance in the target estimate introduces noise. However, the key qualitative result — W₂-based GP outperforms projection baselines by a factor of 5× in RMSE — is clearly replicated.
-
-MLE converged parameters in our run:
-- σ² ≈ 56.49 (output variance scale)
-- ℓ ≈ 0.157 (W₂ correlation length)
-- H ≈ 0.98 (close to 1 → near-Gaussian kernel)
+This is deliberately a nonlinear mix of mean and spread — something W₂ captures naturally.
 
 ---
 
-## The Full Pipeline (Conceptual Flow)
+## Slide 13 — Did It Work? The Results
 
-```
-1. generate_dataset(n=100, seed=0)
-        ↓
-   [dist_1, dist_2, ..., dist_100], [F(ν_1), ..., F(ν_100)]
+We trained on **100 bags**, predicted on **500 new bags**, measured RMSE (average prediction error).
 
-2. pairwise_w2_matrix(train_distributions)
-        ↓
-   D_train : 100×100 matrix of W₂ distances
-
-3. fit_gp(D_train, y_train)
-        → MLE over (σ², ℓ, H) using L-BFGS-B with 5 restarts
-        ↓
-   best_params : {sigma2, ell, H}
-
-4. For each test distribution ν*:
-        w2_to_train = [W₂(ν*, νᵢ) for i in 1..100]
-        r = kernel_power_exp(w2_to_train, best_params)
-        y_pred, y_var = Kriging formula
-        ↓
-   (y_pred, y_var) for each of 500 test points
-
-5. compute_metrics(y_true, y_pred, sqrt(y_var))
-        ↓
-   RMSE, CIR₀.₉
-```
-
----
-
-## Key Mathematical Connections (Paper → Code)
-
-| Paper equation | Code location | What it does |
+| Model | RMSE | Notes |
 |---|---|---|
-| W₂(μ,ν) = √∫(q_μ−q_ν)² dt  (eq. 2, 24) | `wasserstein.py: wasserstein2()` | Core distance metric |
-| K_{σ²,ℓ,H}(μ,ν) = σ²·exp(−W₂^{2H}/ℓ)  (eq. 14) | `kernels.py: kernel_power_exp()` | GP covariance kernel |
-| L_θ = log det R + yᵀR⁻¹y  (eq. 19) | `gp_regression.py: neg_log_likelihood()` | MLE objective |
-| Ŷ(μ*) = rᵀ R⁻¹ y  (eq. 20) | `gp_regression.py: predict()` | Kriging prediction |
-| W₂^{2H} is negative definite iff H ∈ (0,1]  (Thm IV.3) | Enforced via sigmoid on H in MLE | Guarantees valid kernel |
+| **Our W₂ GP** | **0.169** | ✅ Best by far |
+| Legendre (order 5) | 0.956 | ~5.6× worse |
+| PCA (order 5) | 0.986 | ~5.8× worse |
+
+**Paper's numbers:** their W₂ GP got 0.094 (we got 0.169 — we used fewer samples per bag, so more noise in the target estimates). But the qualitative story is the same: **W₂-based GP crushes projection baselines**.
+
+We also checked calibration (CIR₀.₉): we got **0.87**, meaning 87% of true values fell inside the 90% confidence interval. Pretty well calibrated.
 
 ---
 
-## Why This Works (Intuition)
+## Slide 14 — The Full Pipeline in One Picture
 
-Standard GP kernels measure similarity via Euclidean distance between feature vectors. When inputs are distributions, Euclidean distance between density values (L² distance) is a poor proxy for how "similar" two distributions really are — it depends heavily on where the mass is, not just how much there is.
+```
+100 random bumpy bags  ──┐
+                         ├─► pairwise W₂ distances (100×100 table)
+                         │
+                         └─► MLE: learn σ², ℓ, H from training data
+                                        │
+500 new test bags ──────────────────────┴─► Kriging: predict + uncertainty
+                                                      │
+                                               RMSE = 0.169 ✅
+```
 
-W₂ measures the minimum cost to transport one distribution's mass into the shape of the other. Two narrow Gaussians with slightly different means are very close in W₂ (a small shift moves the mass cheaply), and they also have similar target values F(ν). Two Gaussians with very different widths are far in W₂. L² projections can confuse these cases.
+Every step maps to one file:
 
-By plugging W₂ into a standard GP kernel framework, we get a model that inherits all of GP's uncertainty quantification and MLE apparatus, while using a geometrically appropriate notion of similarity for distribution inputs.
+| What | File |
+|---|---|
+| Make the bags | `data_generation.py` |
+| Compute W₂ | `wasserstein.py` |
+| Build the kernel | `kernels.py` |
+| Learn the knobs + predict | `gp_regression.py` |
+| Legendre & PCA baselines | `baselines.py` |
+| Run everything + print table | `run_simulation.py` |
+| Draw the 6 diagnostic plots | `plot_results.py` |
 
 ---
 
-## Dependencies
+## Slide 15 — The One Sentence Summary
 
-```
-numpy >= 1.23     — numerical arrays, linear algebra
-scipy >= 1.9      — trapezoid integration, L-BFGS-B optimiser, norm.ppf
-matplotlib >= 3.6 — all plots
-```
-
-Run the simulation:
-```
-python run_simulation.py   # prints Table I to console (~30 sec)
-python plot_results.py     # saves 6 .png diagnostic figures
-```
+> We replaced "how different do these histograms look?" with "how much work does it take to move one bag of marbles into the other?" — and that one change made our predictions **5× more accurate**.
 
 ---
 
-*Simulation study completed June 2026 | IITPKD Summer Internship | GitHub: itsmilindsahu/Simulation_IITPKD_*
+*IITPKD Summer Internship 2026 | Supervisor: Dr. Tanmay Sahoo | github.com/itsmilindsahu/Simulation_IITPKD_*
